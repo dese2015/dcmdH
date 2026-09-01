@@ -1,0 +1,177 @@
+import os, sys, json, zipfile, urllib.request, urllib.error
+
+OWNER = 'dese2015'         # your GitHub user or org name
+REPO = 'dcmdH'             # the repository name (must be PUBLIC)
+TAG_PREFIX = 'v'           # release tag prefix, e.g. v4.5.0
+ASSET_NAME = 'dcmdH.zip'
+
+API = 'https://api.github.com'
+
+
+def app_home():
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+def version():
+    for p in (os.path.join(app_home(), 'Version.txt'),
+              os.path.join(app_home(), 'dist', 'dcmdH', 'Version.txt')):
+        if os.path.isfile(p):
+            try:
+                v = open(p, encoding='utf-8').read().strip()
+                if v:
+                    return v
+            except OSError:
+                pass
+    return None
+
+
+def github_token():
+    t = os.environ.get('GH_TOKEN')
+    if t:
+        return t.strip()
+    p = os.path.join(app_home(), 'github_token.txt')
+    if os.path.isfile(p):
+        try:
+            return open(p, encoding='utf-8').read().strip()
+        except OSError:
+            return None
+    return None
+
+
+def make_zip(zip_path):
+    src = os.path.join(app_home(), 'dist', 'dcmdH')
+    if not os.path.isdir(src):
+        raise SystemExit('[!] dist\\dcmdH not found - build first: '
+                         'pyinstaller dcmdH.spec')
+    if os.path.isfile(zip_path):
+        os.remove(zip_path)
+    n = 0
+    with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as z:
+        for root, dirs, files in os.walk(src):
+            for f in files:
+                full = os.path.join(root, f)
+                rel = os.path.relpath(full, src)
+                z.write(full, rel)
+                n += 1
+    print(f'[OK] zipped {n} file(s) -> {zip_path}')
+
+
+def api(method, url, token, data=None, headers=None, timeout=120):
+    """Small GitHub REST helper. Returns (status, json_dict)."""
+    h = {'Authorization': 'token ' + token,
+         'Accept': 'application/vnd.github+json',
+         'User-Agent': 'dcmdH-upload'}
+    if headers:
+        h.update(headers)
+    body = None
+    if data is not None:
+        body = json.dumps(data).encode('utf-8')
+        h['Content-Type'] = 'application/json'
+    req = urllib.request.Request(url, data=body, headers=h, method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            raw = r.read().decode('utf-8') or '{}'
+            return r.status, json.loads(raw)
+    except urllib.error.HTTPError as e:
+        detail = ''
+        try:
+            detail = json.loads(e.read().decode('utf-8')).get('message', '')
+        except Exception:
+            pass
+        return e.code, {'error': detail or str(e)}
+
+
+def get_release(tag, token):
+    status, rel = api('GET', f'{API}/repos/{OWNER}/{REPO}/releases/tags/{tag}', token)
+    if status == 200:
+        return rel
+    if status == 404:
+        return None
+    raise SystemExit(f'[!] cannot query release {tag}: HTTP {status} '
+                     f'{rel.get("error", "")}')
+
+
+def create_release(tag, token, version):
+    status, rel = api('POST', f'{API}/repos/{OWNER}/{REPO}/releases', token,
+                      {'tag_name': tag,
+                       'name': f'dcmdH {version}',
+                       'body': f'Packaged dcmdH build v{version}.\n'
+                               f'Used by dcmdH_check.py "download lost".'})
+    if status not in (200, 201):
+        raise SystemExit(f'[!] cannot create release: HTTP {status} '
+                         f'{rel.get("error", "")}')
+    return rel
+
+
+def upload_asset(release_id, zip_path, token):
+    name = os.path.basename(zip_path)
+    with open(zip_path, 'rb') as f:
+        body = f.read()
+    h = {'Content-Type': 'application/zip'}
+    url = f'{API}/repos/{OWNER}/{REPO}/releases/{release_id}/assets?name={name}'
+    status, asset = api('POST', url, token, data=None, headers=h)
+    return status, asset
+
+
+def main():
+    zip_only = '--zip-only' in sys.argv
+    v = version()
+    if not v:
+        raise SystemExit('[!] Version.txt not found')
+    tag = TAG_PREFIX + v
+    zip_path = os.path.join(app_home(), ASSET_NAME)
+
+    print(f'[*] dcmdH v{v} -> tag {tag}')
+    make_zip(zip_path)
+    print(f'[*] {os.path.getsize(zip_path):,} bytes')
+
+    if zip_only:
+        return
+
+    if OWNER == 'your-name':
+        raise SystemExit('[!] edit upload_build.py first and set OWNER / REPO')
+    t = github_token()
+    if not t:
+        raise SystemExit('[!] no GitHub token: set GH_TOKEN or create '
+                         'github_token.txt (scope: repo)')
+
+    # make sure the repo exists and is public (downloads need no auth)
+    status, repo = api('GET', f'{API}/repos/{OWNER}/{REPO}', t)
+    if status != 200:
+        raise SystemExit(f'[!] cannot access repo: HTTP {status} '
+                         f'{repo.get("error", "")}')
+    if repo.get('private'):
+        print('[!] WARNING: repo is PRIVATE - the download link will only work '
+              'with authentication!')
+
+    print(f'[*] uploading to github.com/{OWNER}/{REPO} ...')
+    rel = get_release(tag, t)
+    if rel is None:
+        rel = create_release(tag, t, v)
+        print(f'[OK] created release {tag}')
+    else:
+        print(f'[OK] release {tag} already exists')
+
+    # GitHub cannot overwrite assets: delete the old one first
+    for a in rel.get('assets', []):
+        if a['name'] == ASSET_NAME:
+            status, _ = api('DELETE',
+                            f"{API}/repos/{OWNER}/{REPO}/releases/assets/{a['id']}",
+                            t)
+            if status not in (200, 204, 404):
+                raise SystemExit(f'[!] cannot delete old asset: HTTP {status}')
+            print('[OK] deleted old dcmdH.zip asset')
+
+    status, asset = upload_asset(rel['id'], zip_path, t)
+    if status not in (200, 201):
+        raise SystemExit(f'[!] upload failed: HTTP {status} '
+                         f'{asset.get("error", "")}')
+    url = asset.get('browser_download_url', '')
+    print(f'[OK] uploaded: {url}')
+    print()
+    print('Done! Now put this line in Startup.py:')
+    print(f"    UPDATE_URL = '{url}'")
+
+
+if __name__ == '__main__':
+    main()
